@@ -378,14 +378,6 @@ class ProcessingEngine:
                         all_files.append(full)
         return all_files
 
-    @staticmethod
-    def _mtime_date(fp):
-        """仅用文件修改时间分组（不打开文件，极快）"""
-        try:
-            return datetime.fromtimestamp(os.path.getmtime(fp))
-        except:
-            return datetime.now()
-
     def run(self, report, total_count):
         """两阶段处理：先扫日期分组，再逐天处理（支持同天GPS继承）"""
 
@@ -414,22 +406,55 @@ class ProcessingEngine:
         report("read_progress", (0, rem_total))
         report("write_progress", (0, rem_total))
 
-        # === 阶段二：按天分组（仅用 mtime，不打开文件） ===
-        report("phase", "📅 扫描日期（mtime）")
+        # === 阶段二：读取全部文件元数据（一次遍历，读完所有EXIF） ===
+        report("phase", "📖 读取全部文件元数据")
+        all_metas = []
         date_groups = {}
         for idx, fp in enumerate(remaining):
             if self.stop_event.is_set():
                 report("log", "⏹ 已暂停"); report("done", False); return
-            dt = self._mtime_date(fp)
-            ext = os.path.splitext(fp)[1].lower()
-            date_groups.setdefault(dt.strftime("%Y-%m-%d"), []).append((fp, ext))
+
+            rel = os.path.relpath(fp, self.source_dir)
+            report("current", rel)
             report("sub_progress", (idx + 1, rem_total))
 
-        report("log", f"📅 {len(date_groups)} 个日期待处理（具体EXIF日期将在处理时读取）")
+            ext = os.path.splitext(fp)[1].lower()
+            is_video = ext in VIDEO_EXTS
 
-        # === 阶段三：逐天处理 ===
+            # 一次读取：日期 + 设备 + GPS
+            dt = None
+            if is_video:
+                dt = self._read_video_date(fp)
+            else:
+                dt = self._read_image_date(fp)
+            if not dt:
+                try:
+                    dt = datetime.fromtimestamp(os.path.getmtime(fp))
+                except:
+                    dt = datetime.now()
+            device = self._read_device(fp) or "未知设备"
+            gps = self._read_gps(fp)
+
+            meta = {"path": fp, "device": device, "gps": gps,
+                    "dt": dt, "ext": ext, "is_video": is_video,
+                    "filename": os.path.basename(fp),
+                    "name_no_ext": os.path.splitext(os.path.basename(fp))[0]}
+
+            all_metas.append(meta)
+            ds = dt.strftime("%Y-%m-%d")
+            date_groups.setdefault(ds, []).append(meta)
+
+            # 读取进度 + 文件信息
+            report("read_progress", (idx + 1, rem_total))
+            gps_str = f"{gps[0]:.6f}, {gps[1]:.6f}" if gps else "无GPS"
+            report("file_info",
+                f"📄 {os.path.basename(fp)}  |  📅 {dt.strftime('%Y-%m-%d %H:%M:%S')}"
+                f"  |  📱 {device}  |  📍 {gps_str}  |  💾 {self._fmt_size(os.path.getsize(fp))}")
+
+        report("log", f"📅 元数据读取完毕，共 {len(date_groups)} 个日期")
+
+        # === 阶段三：逐天处理（地理编码+复制） ===
         success = errors = 0
-        read_so_far = 0
         write_so_far = 0
         sorted_dates = sorted(date_groups.keys())
 
@@ -442,46 +467,11 @@ class ProcessingEngine:
             report("log", f"\n── [{date_idx+1}/{len(sorted_dates)}] {date_str} ({n}个文件) ──")
             report("status", f"处理 {date_str}")
 
-            # ── A) 读取元数据（EXIF 日期+设备+GPS，一次打开文件） ──
-            report("phase", f"📖 读取EXIF {date_str}")
-            file_metas = []; unique_gps = set()
-            for i, (fp, ext) in enumerate(entries):
-                if self.stop_event.is_set():
-                    report("log", "⏹ 已暂停"); report("done", False); return
-                rel = os.path.relpath(fp, self.source_dir)
-                report("current", rel)
-                report("sub_progress", (i + 1, n))
-                is_video = ext in VIDEO_EXTS
-                # 读取真实 EXIF 日期（覆盖 mtime 分组）
-                dt = None
-                if is_video:
-                    dt = self._read_video_date(fp)
-                else:
-                    dt = self._read_image_date(fp)
-                if not dt:
-                    try:
-                        dt = datetime.fromtimestamp(os.path.getmtime(fp))
-                    except:
-                        dt = datetime.now()
-                device = self._read_device(fp) or "未知设备"
-                gps = self._read_gps(fp)
-                file_metas.append({"path": fp, "device": device, "gps": gps,
-                    "dt": dt, "ext": ext, "is_video": is_video,
-                    "filename": os.path.basename(fp),
-                    "name_no_ext": os.path.splitext(os.path.basename(fp))[0]})
-                if gps: unique_gps.add(gps)
-
-                # 读取进度
-                read_so_far += 1
-                report("read_progress", (read_so_far, rem_total))
-
-                # 文件信息
-                fname = os.path.basename(fp)
-                dt_str = dt.strftime("%Y-%m-%d %H:%M:%S")
-                size_str = self._fmt_size(os.path.getsize(fp))
-                gps_str = f"{gps[0]:.6f}, {gps[1]:.6f}" if gps else "无GPS"
-                file_info = f"📄 {fname}  |  📅 {dt_str}  |  📱 {device}  |  📍 {gps_str}  |  💾 {size_str}"
-                report("file_info", file_info)
+            # 收集本日不重复 GPS
+            unique_gps = set()
+            for meta in entries:
+                if meta["gps"]:
+                    unique_gps.add(meta["gps"])
 
             # ── B) 逆地理编码 ──
             location_map = {}
@@ -492,8 +482,10 @@ class ProcessingEngine:
                         report("log", "⏹ 已暂停"); report("done", False); return
                     report("sub_progress", (gi + 1, len(unique_gps)))
                     r = self._geocode(gps[0], gps[1])
-                    k = f"{gps[0]},{gps[1]}"
-                    if r: location_map[k] = r["short"]; report("geocode", (gps, r["display"], r["short"]))
+                    if r:
+                        k = f"{gps[0]},{gps[1]}"
+                        location_map[k] = r["short"]
+                        report("geocode", (gps, r["display"], r["short"]))
                 report("log", f"  🌐 {len(location_map)} 个位置已解析")
 
             # ── C) 降级位置 ──
@@ -501,28 +493,33 @@ class ProcessingEngine:
             if location_map:
                 from collections import Counter
                 locs = [v for v in location_map.values() if v and v != "API错误"]
-                if locs: fallback_location = Counter(locs).most_common(1)[0][0]; report("log", f"  📌 降级位置: {fallback_location}")
+                if locs:
+                    fallback_location = Counter(locs).most_common(1)[0][0]
+                    report("log", f"  📌 降级位置: {fallback_location}")
 
-            # ── D1) 先复制有GPS的文件 ──
-            gps_m = [m for m in file_metas if m["gps"]]
+            # ── D1) 复制有GPS的文件 ──
+            gps_m = [m for m in entries if m["gps"]]
             if gps_m:
                 report("phase", f"📝 写入 {len(gps_m)}个带GPS文件")
                 for fi, meta in enumerate(gps_m):
-                    if self.stop_event.is_set(): report("log", "⏹ 已暂停"); report("done", False); return
+                    if self.stop_event.is_set():
+                        report("log", "⏹ 已暂停"); report("done", False); return
                     self._copy_one(meta, date_str, location_map, report)
                     write_so_far += 1
                     report("write_progress", (write_so_far, rem_total))
                     report("sub_progress", (fi + 1, len(gps_m)))
                     success += 1
 
-            # ── D2) 再复制无GPS的文件（继承位置） ──
-            nogps_m = [m for m in file_metas if not m["gps"]]
+            # ── D2) 复制无GPS的文件 ──
+            nogps_m = [m for m in entries if not m["gps"]]
             if nogps_m:
                 lbl = f"📝 写入 {len(nogps_m)}个无GPS文件"
-                if fallback_location: lbl += f" ←{fallback_location}"
+                if fallback_location:
+                    lbl += f" ←{fallback_location}"
                 report("phase", lbl)
                 for fi, meta in enumerate(nogps_m):
-                    if self.stop_event.is_set(): report("log", "⏹ 已暂停"); report("done", False); return
+                    if self.stop_event.is_set():
+                        report("log", "⏹ 已暂停"); report("done", False); return
                     self._copy_one(meta, date_str, {}, report, fallback_location)
                     write_so_far += 1
                     report("write_progress", (write_so_far, rem_total))
