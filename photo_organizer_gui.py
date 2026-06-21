@@ -402,242 +402,83 @@ class ProcessingEngine:
         return all_files
 
     def run(self, report, total_count):
-        """两阶段处理：先扫日期分组，再逐天处理（支持同天GPS继承）"""
-
-        # === 阶段一：扫描文件 ===
-        report("phase", "📂 扫描文件")
-        report("status", "正在扫描文件...")
-
+        """Single pass: read EXIF -> geocode (if GPS) -> copy immediately"""
+        report("phase", "Scan files"); report("status", "Scanning...")
         all_files = self._collect_files()
-        total = len(all_files)
-        report("total", total)
-        report("status", f"共找到 {total} 个文件")
-
-        # 过滤已处理
+        total = len(all_files); report("total", total); report("status", f"Found {total} files")
         remaining = [f for f in all_files if f not in self.cache["processed"]]
         done_count = total - len(remaining)
-        if done_count > 0:
-            report("log", f"⏭ {done_count} 个已在缓存中，跳过")
-        if not remaining:
-            report("status", "所有文件已处理完毕！")
-            report("phase", "✅ 完成")
-            report("done", True)
-            return
+        if done_count > 0: report("log", f"Skipped {done_count} already cached")
+        if not remaining: report("status","All done!"); report("phase","Done"); report("done",True); return
+        rem_total = len(remaining); report("log", f"Processing {rem_total} files")
+        self.file_cur = 0; self.file_tot = rem_total
 
-        rem_total = len(remaining)
-        report("log", f"▶ 开始处理 {rem_total} 个文件")
-        self.read_file = "等待开始"
-        self.file_cur = 0
-        self.file_tot = rem_total
-
-        # === 阶段二：读取全部文件元数据（一次遍历，读完所有EXIF） ===
-        report("phase", "📖 读取全部文件元数据")
-        all_metas = []
-        date_groups = {}
         for idx, fp in enumerate(remaining):
-            if self.stop_event.is_set():
-                report("log", "⏹ 已暂停"); report("done", False); return
+            if self.stop_event.is_set(): report("log","Paused"); report("done",False); return
 
-            rel = os.path.relpath(fp, self.source_dir)
             fname = os.path.basename(fp)
-            report("current", rel)
-            report("sub_progress", (idx + 1, rem_total))
-            self.read_file = fname
-            self.file_read_pct = 100
-            report("file_read", (100, fname))
-
             ext = os.path.splitext(fp)[1].lower()
             is_video = ext in VIDEO_EXTS
+            report("current", os.path.relpath(fp, self.source_dir))
+            report("sub_progress", (idx+1, rem_total))
+            self.file_cur = idx+1
 
-            # 读取：日期 + 设备 + GPS
-            dt = None
-            date_source = "文件创建时间"
-            if is_video:
-                dt = self._read_video_date(fp)
+            # Read EXIF date
+            dt = None; date_source = "ctime"
+            if is_video: dt = self._read_video_date(fp)
+            else: dt = self._read_image_date(fp)
+            if dt: date_source = "EXIF"
             else:
-                dt = self._read_image_date(fp)
-            if dt:
-                date_source = "EXIF"
-            else:
-                try:
-                    dt = datetime.fromtimestamp(os.path.getctime(fp))
-                except:
-                    dt = datetime.now()
+                try: dt = datetime.fromtimestamp(os.path.getctime(fp))
+                except: dt = datetime.now()
+            self.read_pct = math.ceil((idx+1)/rem_total*100)
 
-            device = self._read_device(fp) or "未知设备"
+            # Read device + GPS
+            device = self._read_device(fp) or "unknown"
             gps = self._read_gps(fp)
 
-            self.read_pct = math.ceil((idx + 1) / rem_total * 100)  # 累计
-
-            meta = {"path": fp, "device": device, "gps": gps,
-                    "dt": dt, "ext": ext, "is_video": is_video,
-                    "filename": fname,
-                    "name_no_ext": os.path.splitext(fname)[0]}
-
-            all_metas.append(meta)
-            ds = dt.strftime("%Y-%m-%d")
-            date_groups.setdefault(ds, []).append(meta)
-
-            # 文件统计
-            self.file_cur = idx + 1
-            self.file_tot = rem_total
-            gps_str = f"{gps[0]:.6f}, {gps[1]:.6f}" if gps else "无GPS"
-            report("file_info",
-                f"📄 {fname}  |  📅 {dt.strftime('%Y-%m-%d %H:%M:%S')} [{date_source}]"
-                f"  |  📱 {device}  |  📍 {gps_str}  |  💾 {self._fmt_size(os.path.getsize(fp))}")
-
-        report("log", f"📅 元数据读取完毕，共 {len(date_groups)} 个日期")
-
-        # === 阶段三：逐天处理（地理编码+复制） ===
-        success = errors = 0
-        write_so_far = 0
-        self.write_pct = 0
-        sorted_dates = sorted(date_groups.keys())
-
-        for date_idx, date_str in enumerate(sorted_dates):
-            if self.stop_event.is_set():
-                report("log", "⏹ 已暂停"); report("done", False); return
-
-            entries = date_groups[date_str]
-            n = len(entries)
-            report("log", f"\n── [{date_idx+1}/{len(sorted_dates)}] {date_str} ({n}个文件) ──")
-            report("status", f"处理 {date_str}")
-
-            # 收集本日不重复 GPS
-            unique_gps = set()
-            for meta in entries:
-                if meta["gps"]:
-                    unique_gps.add(meta["gps"])
-
-            # ── B) 逆地理编码 ──
-            location_map = {}
-            if unique_gps:
-                report("phase", f"🌐 地址解析 {date_str}")
-                for gi, gps in enumerate(sorted(unique_gps)):
-                    if self.stop_event.is_set():
-                        report("log", "⏹ 已暂停"); report("done", False); return
-                    report("sub_progress", (gi + 1, len(unique_gps)))
+            # Geocode if has GPS (cached)
+            location = None
+            if gps:
+                key = f"{gps[0]},{gps[1]}"
+                if key in self.cache["geocode"]:
+                    location = self.cache["geocode"][key]["short"]
+                else:
                     r = self._geocode(gps[0], gps[1])
                     if r:
-                        k = f"{gps[0]},{gps[1]}"
-                        location_map[k] = r["short"]
+                        location = r["short"]
                         report("geocode", (gps, r["display"], r["short"]))
-                report("log", f"  🌐 {len(location_map)} 个位置已解析")
 
-            # ── C) 降级位置 ──
-            fallback_location = None
-            if location_map:
-                from collections import Counter
-                locs = [v for v in location_map.values() if v and v != "API错误"]
-                if locs:
-                    fallback_location = Counter(locs).most_common(1)[0][0]
-                    report("log", f"  📌 降级位置: {fallback_location}")
+            # Build path: year/date/location/device/  or  year/date/no-gps/device/
+            year = dt.strftime("%Y"); date = dt.strftime("%Y-%m-%d")
+            if gps and location:
+                subdir = f"{location}/{device}"
+            else:
+                subdir = f"no-gps/{device}"
+            tdir = os.path.join(self.target_dir, year, date, subdir)
+            tp = dt.strftime("%Y%m%d_%H%M%S")
+            new = f"{tp}_{fname}"
+            dst = os.path.join(tdir, new)
+            c = 1
+            while os.path.exists(dst):
+                new = f"{tp}_{c}_{fname}"; dst = os.path.join(tdir, new); c += 1
 
-            # ── D1) 复制有GPS的文件 ──
-            gps_m = [m for m in entries if m["gps"]]
-            if gps_m:
-                report("phase", f"📝 写入 {len(gps_m)}个带GPS文件")
-                for fi, meta in enumerate(gps_m):
-                    if self.stop_event.is_set():
-                        report("log", "⏹ 已暂停"); report("done", False); return
-                    self.write_file = meta["filename"]
-                    report("file_write", (0, meta["filename"]))
-                    self._copy_one(meta, date_str, location_map, report)
-                    write_so_far += 1
-                    self.write_pct = math.ceil(write_so_far / rem_total * 100) if rem_total else 0  # 累计
-                    self.file_write_pct = 100
-                    report("file_write", (100, meta["filename"]))
-                    self.file_cur = write_so_far
-                    self.file_tot = rem_total
-                    report("sub_progress", (fi + 1, len(gps_m)))
-                    success += 1
+            # Copy
+            try:
+                os.makedirs(tdir, exist_ok=True); shutil.copy2(fp, dst)
+            except Exception as e:
+                report("log", f"FAIL {fname}: {e}")
+                self.cache["processed"][fp] = {"error":str(e),"copied":False}
+                self._save_cache(); continue
 
-            # ── D2) 复制无GPS的文件 ──
-            nogps_m = [m for m in entries if not m["gps"]]
-            if nogps_m:
-                lbl = f"📝 写入 {len(nogps_m)}个无GPS文件"
-                if fallback_location:
-                    lbl += f" ←{fallback_location}"
-                report("phase", lbl)
-                for fi, meta in enumerate(nogps_m):
-                    if self.stop_event.is_set():
-                        report("log", "⏹ 已暂停"); report("done", False); return
-                    self.write_file = meta["filename"]
-                    report("file_write", (0, meta["filename"]))
-                    self._copy_one(meta, date_str, {}, report, fallback_location)
-                    write_so_far += 1
-                    self.write_pct = math.ceil(write_so_far / rem_total * 100) if rem_total else 0  # 累计
-                    self.file_write_pct = 100
-                    report("file_write", (100, meta["filename"]))
-                    self.file_cur = write_so_far
-                    self.file_tot = rem_total
-                    report("sub_progress", (fi + 1, len(nogps_m)))
-                    success += 1
-
-            processed_so_far = done_count + success + errors
-            report("pct", round(processed_so_far / total * 100 if total else 0, 1))
-
-        report("log", f"\n✅ 完成！成功 {success} / 失败 {errors}")
-        report("status", f"完成！成功 {success} / 失败 {errors}")
-        report("phase", "✅ 全部完成")
-        report("done", True)
-
-    # ---------- 复制单个文件 ----------
-
-    def _copy_one(self, meta, date_str, location_map, report, fallback_location=None):
-        """复制单个文件到目标目录，写入阶段进度"""
-        location = None
-        inherited = False
-        if meta["gps"]:
-            k = f"{meta['gps'][0]},{meta['gps'][1]}"
-            location = location_map.get(k) if location_map else None
-        elif fallback_location:
-            location = fallback_location
-            inherited = True
-
-        device = meta["device"]
-        if meta["is_video"] and not meta["gps"]:
-            device_dir = f"{device}_视频"
-        elif device and location:
-            device_dir = f"{device} ({location})"
-        elif device:
-            device_dir = device
-        else:
-            device_dir = "未知位置"
-
-        y = meta["dt"].strftime("%Y")
-        tdir = os.path.join(self.target_dir, y, date_str, device_dir)
-        tp = meta["dt"].strftime("%Y%m%d_%H%M%S")
-        new = f"{tp}_{meta['name_no_ext']}{meta['ext']}"
-        dst = os.path.join(tdir, new)
-        c = 1
-        while os.path.exists(dst):
-            new = f"{tp}_{meta['name_no_ext']}_{c}{meta['ext']}"
-            dst = os.path.join(tdir, new); c += 1
-
-        try:
-            os.makedirs(tdir, exist_ok=True)
-            shutil.copy2(meta["path"], dst)
-        except Exception as e:
-            report("log", f"✗ {meta['filename']}: {e}")
-            self.cache["processed"][meta["path"]] = {"error": str(e), "copied": False,
-                "processed_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+            report("log", f"OK {fname} -> {year}/{date}/{subdir}/{new}")
+            self.cache["processed"][fp] = {"copied":True,"target":dst,"date":date,"year":year,"device":device,"gps":gps,"location":location}
             self._save_cache()
-            return
 
-        tag = " ↩" if inherited else ""
-        report("log", f"✓ {meta['filename']} → {date_str}/{device_dir}/{new}{tag}")
-        self.cache["processed"][meta["path"]] = {"copied": True, "target": dst,
-            "date": date_str, "year": y, "device": device, "gps": meta["gps"],
-            "location": location, "inherited_gps": inherited, "is_video": meta["is_video"],
-            "processed_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
-        self._save_cache()
-        report("progress", 1)
+            report("file_info", f"{fname} | {dt.strftime('%Y-%m-%d %H:%M:%S')} [{date_source}] | {device} | {'GPS' if gps else 'no-GPS'}")
 
-
-# ============================================================
-# GUI
-# ============================================================
+        report("log", f"\nDone! processed {rem_total} files")
+        report("status", "All done!"); report("phase", "Done"); report("done", True)
 
 class PhotoOrganizerGUI:
     def __init__(self):
