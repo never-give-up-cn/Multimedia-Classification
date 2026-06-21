@@ -36,7 +36,7 @@ VIDEO_EXTS = {'.mp4', '.mov', '.avi', '.mkv', '.mts', '.m2ts',
 ALL_EXTS = IMAGE_EXTS | VIDEO_EXTS
 
 NOMINATIM_URL = "https://api.mirror-earth.com/nominatim/reverse"
-NOMINATIM_DELAY = 0.5  # 秒（2次/秒）
+NOMINATIM_DELAY = 0.1  # 秒（10次/秒）
 
 # ============================================================
 # 处理引擎（后台线程运行）
