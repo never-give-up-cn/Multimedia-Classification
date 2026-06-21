@@ -73,6 +73,14 @@ class ProcessingEngine:
         except Exception:
             pass
 
+    @staticmethod
+    def _fmt_size(size_bytes):
+        for unit in ('B', 'KB', 'MB', 'GB'):
+            if size_bytes < 1024:
+                return f"{size_bytes:.1f} {unit}"
+            size_bytes /= 1024
+        return f"{size_bytes:.1f} TB"
+
     # ---------- EXIF 读取 ----------
 
     def _pil_exif(self, path):
@@ -409,12 +417,15 @@ class ProcessingEngine:
             report("done", True)
             return
 
-        report("log", f"▶ 开始处理 {len(remaining)} 个文件")
+        rem_total = len(remaining)
+        report("log", f"▶ 开始处理 {rem_total} 个文件")
+        report("read_progress", (0, rem_total))
+        report("write_progress", (0, rem_total))
 
         # === 阶段二：按天分组 ===
         report("phase", "📅 扫描日期")
         date_groups = {}
-        sc = len(remaining)
+        sc = rem_total
         for idx, fp in enumerate(remaining):
             if self.stop_event.is_set():
                 report("log", "⏹ 已暂停"); report("done", False); return
@@ -426,6 +437,8 @@ class ProcessingEngine:
 
         # === 阶段三：逐天处理 ===
         success = errors = 0
+        read_so_far = 0
+        write_so_far = 0
         sorted_dates = sorted(date_groups.keys())
 
         for date_idx, date_str in enumerate(sorted_dates):
@@ -443,7 +456,8 @@ class ProcessingEngine:
             for i, (fp, is_video, dt, ext) in enumerate(entries):
                 if self.stop_event.is_set():
                     report("log", "⏹ 已暂停"); report("done", False); return
-                report("current", os.path.relpath(fp, self.source_dir))
+                rel = os.path.relpath(fp, self.source_dir)
+                report("current", rel)
                 report("sub_progress", (i + 1, n))
                 device = self._read_device(fp) or "未知设备"
                 gps = self._read_gps(fp)
@@ -452,6 +466,18 @@ class ProcessingEngine:
                     "filename": os.path.basename(fp),
                     "name_no_ext": os.path.splitext(os.path.basename(fp))[0]})
                 if gps: unique_gps.add(gps)
+
+                # 读取进度
+                read_so_far += 1
+                report("read_progress", (read_so_far, rem_total))
+
+                # 文件信息
+                fname = os.path.basename(fp)
+                dt_str = dt.strftime("%Y-%m-%d %H:%M:%S")
+                size_str = self._fmt_size(os.path.getsize(fp))
+                gps_str = f"{gps[0]:.6f}, {gps[1]:.6f}" if gps else "无GPS"
+                file_info = f"📄 {fname}  |  📅 {dt_str}  |  📱 {device}  |  📍 {gps_str}  |  💾 {size_str}"
+                report("file_info", file_info)
 
             # ── B) 逆地理编码 ──
             location_map = {}
@@ -480,6 +506,8 @@ class ProcessingEngine:
                 for fi, meta in enumerate(gps_m):
                     if self.stop_event.is_set(): report("log", "⏹ 已暂停"); report("done", False); return
                     self._copy_one(meta, date_str, location_map, report)
+                    write_so_far += 1
+                    report("write_progress", (write_so_far, rem_total))
                     report("sub_progress", (fi + 1, len(gps_m)))
                     success += 1
 
@@ -492,6 +520,8 @@ class ProcessingEngine:
                 for fi, meta in enumerate(nogps_m):
                     if self.stop_event.is_set(): report("log", "⏹ 已暂停"); report("done", False); return
                     self._copy_one(meta, date_str, {}, report, fallback_location)
+                    write_so_far += 1
+                    report("write_progress", (write_so_far, rem_total))
                     report("sub_progress", (fi + 1, len(nogps_m)))
                     success += 1
 
@@ -564,8 +594,8 @@ class PhotoOrganizerGUI:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title("照片归类工具 v1.0")
-        self.root.geometry("1000x650")
-        self.root.minsize(850, 550)
+        self.root.geometry("1000x750")
+        self.root.minsize(880, 650)
 
         # 变量
         self.src_var = tk.StringVar(value=DEFAULT_SOURCE)
@@ -585,6 +615,15 @@ class PhotoOrganizerGUI:
         self.phase_var = tk.StringVar(value="等待开始")
         self.sub_progress = tk.StringVar(value="")
 
+        # 读取/写入进度
+        self.read_progress_var = tk.DoubleVar(value=0)
+        self.read_progress_text = tk.StringVar(value="—")
+        self.write_progress_var = tk.DoubleVar(value=0)
+        self.write_progress_text = tk.StringVar(value="—")
+
+        # 文件信息
+        self.file_info_var = tk.StringVar(value="等待开始...")
+
         self.engine = None
         self.worker_thread = None
         self.msg_queue = queue.Queue()
@@ -593,6 +632,8 @@ class PhotoOrganizerGUI:
         self._done_files = 0
         self._success_count = 0
         self._error_count = 0
+        self._read_count = 0
+        self._write_count = 0
 
         # 环境检查
         self._tool_ffprobe = self._check_tool('ffprobe')
@@ -659,7 +700,7 @@ class PhotoOrganizerGUI:
 
         # === 进度区域 ===
         prog_frame = ttk.LabelFrame(main_frame, text=" 进度 ", padding=8)
-        prog_frame.grid(row=4, column=0, columnspan=3, sticky='ew', pady=(0, 6))
+        prog_frame.grid(row=4, column=0, columnspan=3, sticky='ew', pady=(0, 4))
 
         # 阶段指示
         phase_row = ttk.Frame(prog_frame)
@@ -672,16 +713,51 @@ class PhotoOrganizerGUI:
 
         ttk.Label(prog_frame, textvariable=self.current_file,
                   font=('Consolas', 9)).pack(anchor='w', pady=(2, 2))
-        self.progress_bar = ttk.Progressbar(prog_frame, variable=self.progress_var,
-                                            length=600, mode='determinate')
-        self.progress_bar.pack(fill=tk.X, pady=2)
-        ttk.Label(prog_frame, textvariable=self.progress_text).pack(anchor='w')
+
+        # ── 读取进度 ──
+        read_row = ttk.Frame(prog_frame)
+        read_row.pack(fill=tk.X, pady=1)
+        ttk.Label(read_row, text="📖 读取:", font=('Microsoft YaHei UI', 8)).pack(side=tk.LEFT)
+        read_bar = ttk.Progressbar(read_row, variable=self.read_progress_var,
+                                    length=400, mode='determinate')
+        read_bar.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 4))
+        ttk.Label(read_row, textvariable=self.read_progress_text,
+                  font=('Consolas', 8), width=16, anchor='e').pack(side=tk.LEFT)
+
+        # ── 写入进度 ──
+        write_row = ttk.Frame(prog_frame)
+        write_row.pack(fill=tk.X, pady=1)
+        ttk.Label(write_row, text="📝 写入:", font=('Microsoft YaHei UI', 8)).pack(side=tk.LEFT)
+        write_bar = ttk.Progressbar(write_row, variable=self.write_progress_var,
+                                     length=400, mode='determinate')
+        write_bar.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 4))
+        ttk.Label(write_row, textvariable=self.write_progress_text,
+                  font=('Consolas', 8), width=16, anchor='e').pack(side=tk.LEFT)
+
+        # ── 总进度 ──
+        total_row = ttk.Frame(prog_frame)
+        total_row.pack(fill=tk.X, pady=1)
+        ttk.Label(total_row, text="📊 总进度:", font=('Microsoft YaHei UI', 8)).pack(side=tk.LEFT)
+        self.progress_bar = ttk.Progressbar(total_row, variable=self.progress_var,
+                                            length=400, mode='determinate')
+        self.progress_bar.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 4))
+        ttk.Label(total_row, textvariable=self.progress_text,
+                  font=('Consolas', 8), width=16, anchor='e').pack(side=tk.LEFT)
+
+        # === 文件信息区域 ===
+        info_frame = ttk.LabelFrame(main_frame, text=" 📄 当前文件信息 ", padding=6)
+        info_frame.grid(row=5, column=0, columnspan=3, sticky='ew', pady=(0, 4))
+
+        self.info_label = ttk.Label(info_frame, textvariable=self.file_info_var,
+                                     font=('Consolas', 9),
+                                     wraplength=920, anchor='w', justify='left')
+        self.info_label.pack(fill=tk.X, anchor='w')
 
         # === 统计 + 地址解析 + 日志（三栏） ===
         mid_frame = ttk.Frame(main_frame)
-        mid_frame.grid(row=5, column=0, columnspan=3, sticky='nsew', pady=4)
+        mid_frame.grid(row=6, column=0, columnspan=3, sticky='nsew', pady=4)
         main_frame.columnconfigure(0, weight=1)
-        main_frame.rowconfigure(5, weight=1)
+        main_frame.rowconfigure(6, weight=1)
 
         # -- 统计（窄－左） --
         stats_frame = ttk.LabelFrame(mid_frame, text=" 📊 统计 ", padding=8, width=180)
@@ -802,6 +878,11 @@ class PhotoOrganizerGUI:
         self.current_file.set("—")
         self.phase_var.set("启动中...")
         self.sub_progress.set("")
+        self.read_progress_var.set(0)
+        self.read_progress_text.set("—")
+        self.write_progress_var.set(0)
+        self.write_progress_text.set("—")
+        self.file_info_var.set("等待开始...")
 
         self._clear_geo()
         self._log("▶ 开始处理任务")
@@ -887,9 +968,20 @@ class PhotoOrganizerGUI:
         elif msg_type == "phase":
             self.phase_var.set(str(data))
         elif msg_type == "sub_progress":
-            # data = (current, total)
             cur, tot = data
             self.sub_progress.set(f"[{cur}/{tot}]")
+        elif msg_type == "read_progress":
+            cur, tot = data
+            self._read_count = cur
+            self.read_progress_var.set(min(cur, tot))
+            self.read_progress_text.set(f"{cur} / {tot}")
+        elif msg_type == "write_progress":
+            cur, tot = data
+            self._write_count = cur
+            self.write_progress_var.set(min(cur, tot))
+            self.write_progress_text.set(f"{cur} / {tot}")
+        elif msg_type == "file_info":
+            self.file_info_var.set(str(data))
         elif msg_type == "status":
             self.status_var.set(str(data))
         elif msg_type == "geocode":
