@@ -52,6 +52,14 @@ class ProcessingEngine:
         self.stop_event = threading.Event()
         self.last_geo_time = time.time() - NOMINATIM_DELAY
 
+        # GUI 轮询用的共享状态（线程安全，GIL 保护）
+        self.read_file = ""
+        self.read_pct = 0
+        self.write_file = ""
+        self.write_pct = 0
+        self.file_cur = 0
+        self.file_tot = 0
+
     # ---------- 缓存 ----------
 
     def _load_cache(self):
@@ -100,7 +108,16 @@ class ProcessingEngine:
         return default
 
     def _read_image_date(self, path):
+        """读取图片 EXIF 日期，优先 exiftool（最通用），其次 Pillow"""
         ext = os.path.splitext(path)[1].lower()
+
+        # 1) 有 exiftool 时所有格式都优先用它（更准确，支持 CreateDate 等字段）
+        if ext in IMAGE_EXTS:
+            dt = self._exiftool_date(path)
+            if dt:
+                return dt
+
+        # 2) 退回到 Pillow
         if ext in {'.jpg', '.jpeg', '.tif', '.tiff', '.png', '.bmp'}:
             exif = self._pil_exif(path)
             if exif:
@@ -125,10 +142,6 @@ class ProcessingEngine:
                                 return dt
             except Exception:
                 pass
-        elif ext in {'.cr2', '.cr3', '.arw', '.nef', '.dng', '.orf', '.rw2'}:
-            dt = self._exiftool_date(path)
-            if dt:
-                return dt
         return None
 
     def _read_video_date(self, path):
@@ -162,13 +175,20 @@ class ProcessingEngine:
         return None
 
     def _exiftool_date(self, path):
+        """用 exiftool 读取 RAW 日期，尝试多个字段"""
         try:
+            # 尝试 DateTimeOriginal → CreateDate → 通用日期
             r = subprocess.run(
-                ['exiftool', '-DateTimeOriginal', '-d', '%Y:%m:%d %H:%M:%S', path],
+                ['exiftool', '-DateTimeOriginal', '-CreateDate',
+                 '-d', '%Y:%m:%d %H:%M:%S', path],
                 capture_output=True, text=True, timeout=10
             )
-            if r.returncode == 0 and ': ' in r.stdout:
-                return self._parse_exif_date(r.stdout.split(': ', 1)[1].strip())
+            if r.returncode == 0:
+                for line in r.stdout.strip().split('\n'):
+                    if ': ' in line:
+                        dt = self._parse_exif_date(line.split(': ', 1)[1].strip())
+                        if dt:
+                            return dt
         except Exception:
             pass
         return None
@@ -403,8 +423,9 @@ class ProcessingEngine:
 
         rem_total = len(remaining)
         report("log", f"▶ 开始处理 {rem_total} 个文件")
-        report("read_progress", (0, rem_total))
-        report("write_progress", (0, rem_total))
+        self.read_file = "等待开始"
+        self.file_cur = 0
+        self.file_tot = rem_total
 
         # === 阶段二：读取全部文件元数据（一次遍历，读完所有EXIF） ===
         report("phase", "📖 读取全部文件元数据")
@@ -415,40 +436,50 @@ class ProcessingEngine:
                 report("log", "⏹ 已暂停"); report("done", False); return
 
             rel = os.path.relpath(fp, self.source_dir)
+            fname = os.path.basename(fp)
             report("current", rel)
             report("sub_progress", (idx + 1, rem_total))
+            self.read_file = fname
+            self.read_pct = 0
 
             ext = os.path.splitext(fp)[1].lower()
             is_video = ext in VIDEO_EXTS
 
             # 一次读取：日期 + 设备 + GPS
             dt = None
+            date_source = "文件创建时间"
             if is_video:
                 dt = self._read_video_date(fp)
             else:
                 dt = self._read_image_date(fp)
-            if not dt:
+            self.read_pct = 50
+            if dt:
+                date_source = "EXIF"
+            else:
                 try:
-                    dt = datetime.fromtimestamp(os.path.getmtime(fp))
+                    dt = datetime.fromtimestamp(os.path.getctime(fp))
                 except:
                     dt = datetime.now()
+
             device = self._read_device(fp) or "未知设备"
             gps = self._read_gps(fp)
+            self.read_pct = 100
 
             meta = {"path": fp, "device": device, "gps": gps,
                     "dt": dt, "ext": ext, "is_video": is_video,
-                    "filename": os.path.basename(fp),
-                    "name_no_ext": os.path.splitext(os.path.basename(fp))[0]}
+                    "filename": fname,
+                    "name_no_ext": os.path.splitext(fname)[0]}
 
             all_metas.append(meta)
             ds = dt.strftime("%Y-%m-%d")
             date_groups.setdefault(ds, []).append(meta)
 
-            # 读取进度 + 文件信息
-            report("read_progress", (idx + 1, rem_total))
+            # 文件统计
+            self.file_cur = idx + 1
+            self.file_tot = rem_total
             gps_str = f"{gps[0]:.6f}, {gps[1]:.6f}" if gps else "无GPS"
             report("file_info",
-                f"📄 {os.path.basename(fp)}  |  📅 {dt.strftime('%Y-%m-%d %H:%M:%S')}"
+                f"📄 {fname}  |  📅 {dt.strftime('%Y-%m-%d %H:%M:%S')} [{date_source}]"
                 f"  |  📱 {device}  |  📍 {gps_str}  |  💾 {self._fmt_size(os.path.getsize(fp))}")
 
         report("log", f"📅 元数据读取完毕，共 {len(date_groups)} 个日期")
@@ -504,9 +535,13 @@ class ProcessingEngine:
                 for fi, meta in enumerate(gps_m):
                     if self.stop_event.is_set():
                         report("log", "⏹ 已暂停"); report("done", False); return
+                    self.write_file = meta["filename"]
+                    self.write_pct = 0
                     self._copy_one(meta, date_str, location_map, report)
                     write_so_far += 1
-                    report("write_progress", (write_so_far, rem_total))
+                    self.write_pct = 100
+                    self.file_cur = write_so_far
+                    self.file_tot = rem_total
                     report("sub_progress", (fi + 1, len(gps_m)))
                     success += 1
 
@@ -520,9 +555,13 @@ class ProcessingEngine:
                 for fi, meta in enumerate(nogps_m):
                     if self.stop_event.is_set():
                         report("log", "⏹ 已暂停"); report("done", False); return
+                    self.write_file = meta["filename"]
+                    self.write_pct = 0
                     self._copy_one(meta, date_str, {}, report, fallback_location)
                     write_so_far += 1
-                    report("write_progress", (write_so_far, rem_total))
+                    self.write_pct = 100
+                    self.file_cur = write_so_far
+                    self.file_tot = rem_total
                     report("sub_progress", (fi + 1, len(nogps_m)))
                     success += 1
 
@@ -661,9 +700,9 @@ class PhotoOrganizerGUI:
         # 环境提示
         env_warnings = []
         if not self._tool_ffprobe:
-            env_warnings.append("⚠ FFmpeg (ffprobe) 未安装 → 视频日期将使用文件修改时间")
+            env_warnings.append("⚠ FFmpeg (ffprobe) 未安装 → 视频日期将使用文件创建时间")
         if not self._tool_exiftool:
-            env_warnings.append("⚠ ExifTool 未安装 → RAW 文件将使用文件修改时间")
+            env_warnings.append("⚠ ExifTool 未安装 → RAW 文件将使用文件创建时间")
 
         if env_warnings:
             warn_frame = ttk.Frame(self.root)
@@ -723,7 +762,7 @@ class PhotoOrganizerGUI:
                                     length=400, mode='determinate')
         read_bar.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 4))
         ttk.Label(read_row, textvariable=self.read_progress_text,
-                  font=('Consolas', 8), width=16, anchor='e').pack(side=tk.LEFT)
+                  font=('Consolas', 8)).pack(side=tk.LEFT, padx=(2, 0))
 
         # ── 写入进度 ──
         write_row = ttk.Frame(prog_frame)
@@ -733,7 +772,7 @@ class PhotoOrganizerGUI:
                                      length=400, mode='determinate')
         write_bar.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 4))
         ttk.Label(write_row, textvariable=self.write_progress_text,
-                  font=('Consolas', 8), width=16, anchor='e').pack(side=tk.LEFT)
+                  font=('Consolas', 8)).pack(side=tk.LEFT, padx=(2, 0))
 
         # ── 总进度 ──
         total_row = ttk.Frame(prog_frame)
@@ -940,47 +979,45 @@ class PhotoOrganizerGUI:
         self.msg_queue.put((msg_type, data))
 
     def _poll_queue(self):
-        """主线程定时轮询消息队列"""
+        """主线程定时轮询消息队列 + 引擎共享状态"""
         try:
             while True:
                 msg_type, data = self.msg_queue.get_nowait()
                 self._handle_message(msg_type, data)
         except queue.Empty:
             pass
-        self.root.after(100, self._poll_queue)
+
+        # 从引擎直接读取进度状态（实时，不受队列延迟影响）
+        if self.engine:
+            self.read_progress_var.set(self.engine.read_pct)
+            txt = f"{self.engine.read_file}  {self.engine.read_pct}%"
+            self.read_progress_text.set(txt)
+
+            self.write_progress_var.set(self.engine.write_pct)
+            txt = f"{self.engine.write_file}  {self.engine.write_pct}%"
+            self.write_progress_text.set(txt)
+
+            cur, tot = self.engine.file_cur, self.engine.file_tot
+            self.progress_bar.configure(maximum=max(tot, 1))
+            self.progress_var.set(min(cur, tot))
+            pct = round(cur / max(tot, 1) * 100)
+            self.progress_text.set(f"文件 {cur} / {tot}  ({pct}%)")
+            self.stats_done.set(str(cur))
+            if tot:
+                self.stats_total.set(str(tot))
+
+        self.root.after(200, self._poll_queue)
 
     def _handle_message(self, msg_type, data):
         if msg_type == "log":
             self._log(data)
         elif msg_type == "current":
             self.current_file.set(str(data))
-        elif msg_type == "progress":
-            self._done_files += 1
-            self.stats_done.set(str(self._done_files))
-        elif msg_type == "total":
-            self._total_files = data
-            self.stats_total.set(str(data))
-            if data > 0:
-                self.progress_bar.configure(maximum=data)
-                self.progress_var.set(0)
-        elif msg_type == "pct":
-            # data 是百分比数字
-            pass  # already tracked via progress bar value
         elif msg_type == "phase":
             self.phase_var.set(str(data))
         elif msg_type == "sub_progress":
             cur, tot = data
             self.sub_progress.set(f"[{cur}/{tot}]")
-        elif msg_type == "read_progress":
-            cur, tot = data
-            self._read_count = cur
-            self.read_progress_var.set(min(cur, tot))
-            self.read_progress_text.set(f"{cur} / {tot}")
-        elif msg_type == "write_progress":
-            cur, tot = data
-            self._write_count = cur
-            self.write_progress_var.set(min(cur, tot))
-            self.write_progress_text.set(f"{cur} / {tot}")
         elif msg_type == "file_info":
             self.file_info_var.set(str(data))
         elif msg_type == "status":
