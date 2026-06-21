@@ -402,243 +402,144 @@ class ProcessingEngine:
         return all_files
 
     def run(self, report, total_count):
-        """两阶段处理：先扫日期分组，再逐天处理（支持同天GPS继承）"""
-
-        # === 阶段一：扫描文件 ===
-        report("phase", "📂 扫描文件")
-        report("status", "正在扫描文件...")
-
+        """Three threads: scan dates, then 3 threads process date groups"""
+        report("phase", "Scan files")
+        report("status", "Scanning...")
         all_files = self._collect_files()
         total = len(all_files)
         report("total", total)
-        report("status", f"共找到 {total} 个文件")
-
-        # 过滤已处理
+        report("status", f"Found {total} files")
         remaining = [f for f in all_files if f not in self.cache["processed"]]
         done_count = total - len(remaining)
         if done_count > 0:
-            report("log", f"⏭ {done_count} 个已在缓存中，跳过")
+            report("log", f"Skipped {done_count} already in cache")
         if not remaining:
-            report("status", "所有文件已处理完毕！")
-            report("phase", "✅ 完成")
-            report("done", True)
-            return
-
+            report("status", "All done!"); report("phase", "Done"); report("done", True); return
         rem_total = len(remaining)
-        report("log", f"▶ 开始处理 {rem_total} 个文件")
-        self.read_file = "等待开始"
-        self.file_cur = 0
-        self.file_tot = rem_total
-
-        # === 阶段二：读取全部文件元数据（一次遍历，读完所有EXIF） ===
-        report("phase", "📖 读取全部文件元数据")
-        all_metas = []
+        report("log", f"Processing {rem_total} files")
+        self.file_cur = 0; self.file_tot = rem_total
+        self._success = 0; self._errors = 0
+        for s in self.thread_states:
+            s["file"] = ""; s["pct"] = 0; s["phase"] = "waiting"
+        report("phase", "Group by date")
         date_groups = {}
         for idx, fp in enumerate(remaining):
             if self.stop_event.is_set():
-                report("log", "⏹ 已暂停"); report("done", False); return
-
-            rel = os.path.relpath(fp, self.source_dir)
-            fname = os.path.basename(fp)
-            report("current", rel)
-            report("sub_progress", (idx + 1, rem_total))
-            self.read_file = fname
-            self.file_read_pct = 100
-            report("file_read", (100, fname))
-
-            ext = os.path.splitext(fp)[1].lower()
-            is_video = ext in VIDEO_EXTS
-
-            # 读取：日期 + 设备 + GPS
-            dt = None
-            date_source = "文件创建时间"
-            if is_video:
-                dt = self._read_video_date(fp)
-            else:
-                dt = self._read_image_date(fp)
-            if dt:
-                date_source = "EXIF"
-            else:
-                try:
-                    dt = datetime.fromtimestamp(os.path.getctime(fp))
-                except:
-                    dt = datetime.now()
-
-            device = self._read_device(fp) or "未知设备"
-            gps = self._read_gps(fp)
-
-            self.read_pct = math.ceil((idx + 1) / rem_total * 100)  # 累计
-
-            meta = {"path": fp, "device": device, "gps": gps,
-                    "dt": dt, "ext": ext, "is_video": is_video,
-                    "filename": fname,
-                    "name_no_ext": os.path.splitext(fname)[0]}
-
-            all_metas.append(meta)
+                report("log", "Paused"); report("done", False); return
+            try:
+                dt = datetime.fromtimestamp(os.path.getmtime(fp))
+            except:
+                dt = datetime.now()
             ds = dt.strftime("%Y-%m-%d")
-            date_groups.setdefault(ds, []).append(meta)
-
-            # 文件统计
-            self.file_cur = idx + 1
-            self.file_tot = rem_total
-            gps_str = f"{gps[0]:.6f}, {gps[1]:.6f}" if gps else "无GPS"
-            report("file_info",
-                f"📄 {fname}  |  📅 {dt.strftime('%Y-%m-%d %H:%M:%S')} [{date_source}]"
-                f"  |  📱 {device}  |  📍 {gps_str}  |  💾 {self._fmt_size(os.path.getsize(fp))}")
-
-        report("log", f"📅 元数据读取完毕，共 {len(date_groups)} 个日期")
-
-        # === 阶段三：逐天处理（地理编码+复制） ===
-        success = errors = 0
-        write_so_far = 0
-        self.write_pct = 0
-        sorted_dates = sorted(date_groups.keys())
-
-        for date_idx, date_str in enumerate(sorted_dates):
-            if self.stop_event.is_set():
-                report("log", "⏹ 已暂停"); report("done", False); return
-
-            entries = date_groups[date_str]
-            n = len(entries)
-            report("log", f"\n── [{date_idx+1}/{len(sorted_dates)}] {date_str} ({n}个文件) ──")
-            report("status", f"处理 {date_str}")
-
-            # 收集本日不重复 GPS
-            unique_gps = set()
-            for meta in entries:
-                if meta["gps"]:
-                    unique_gps.add(meta["gps"])
-
-            # ── B) 逆地理编码 ──
-            location_map = {}
-            if unique_gps:
-                report("phase", f"🌐 地址解析 {date_str}")
-                for gi, gps in enumerate(sorted(unique_gps)):
-                    if self.stop_event.is_set():
-                        report("log", "⏹ 已暂停"); report("done", False); return
-                    report("sub_progress", (gi + 1, len(unique_gps)))
-                    r = self._geocode(gps[0], gps[1])
-                    if r:
-                        k = f"{gps[0]},{gps[1]}"
-                        location_map[k] = r["short"]
-                        report("geocode", (gps, r["display"], r["short"]))
-                report("log", f"  🌐 {len(location_map)} 个位置已解析")
-
-            # ── C) 降级位置 ──
-            fallback_location = None
-            if location_map:
-                from collections import Counter
-                locs = [v for v in location_map.values() if v and v != "API错误"]
-                if locs:
-                    fallback_location = Counter(locs).most_common(1)[0][0]
-                    report("log", f"  📌 降级位置: {fallback_location}")
-
-            # ── D1) 复制有GPS的文件 ──
-            gps_m = [m for m in entries if m["gps"]]
-            if gps_m:
-                report("phase", f"📝 写入 {len(gps_m)}个带GPS文件")
-                for fi, meta in enumerate(gps_m):
-                    if self.stop_event.is_set():
-                        report("log", "⏹ 已暂停"); report("done", False); return
-                    self.write_file = meta["filename"]
-                    report("file_write", (0, meta["filename"]))
-                    self._copy_one(meta, date_str, location_map, report)
-                    write_so_far += 1
-                    self.write_pct = math.ceil(write_so_far / rem_total * 100) if rem_total else 0  # 累计
-                    self.file_write_pct = 100
-                    report("file_write", (100, meta["filename"]))
-                    self.file_cur = write_so_far
-                    self.file_tot = rem_total
-                    report("sub_progress", (fi + 1, len(gps_m)))
-                    success += 1
-
-            # ── D2) 复制无GPS的文件 ──
-            nogps_m = [m for m in entries if not m["gps"]]
-            if nogps_m:
-                lbl = f"📝 写入 {len(nogps_m)}个无GPS文件"
-                if fallback_location:
-                    lbl += f" ←{fallback_location}"
-                report("phase", lbl)
-                for fi, meta in enumerate(nogps_m):
-                    if self.stop_event.is_set():
-                        report("log", "⏹ 已暂停"); report("done", False); return
-                    self.write_file = meta["filename"]
-                    report("file_write", (0, meta["filename"]))
-                    self._copy_one(meta, date_str, {}, report, fallback_location)
-                    write_so_far += 1
-                    self.write_pct = math.ceil(write_so_far / rem_total * 100) if rem_total else 0  # 累计
-                    self.file_write_pct = 100
-                    report("file_write", (100, meta["filename"]))
-                    self.file_cur = write_so_far
-                    self.file_tot = rem_total
-                    report("sub_progress", (fi + 1, len(nogps_m)))
-                    success += 1
-
-            processed_so_far = done_count + success + errors
-            report("pct", round(processed_so_far / total * 100 if total else 0, 1))
-
-        report("log", f"\n✅ 完成！成功 {success} / 失败 {errors}")
-        report("status", f"完成！成功 {success} / 失败 {errors}")
-        report("phase", "✅ 全部完成")
+            ext = os.path.splitext(fp)[1].lower()
+            date_groups.setdefault(ds, []).append((fp, ext in VIDEO_EXTS, ext))
+            report("sub_progress", (idx + 1, rem_total))
+        report("log", f"{len(date_groups)} date groups, starting 3 threads")
+        self._process_all_dates(date_groups, rem_total, report, done_count, total)
+        report("log", f"Done! success={self._success} errors={self._errors}")
+        report("status", f"Done! success={self._success} errors={self._errors}")
+        report("phase", "All done")
         report("done", True)
 
-    # ---------- 复制单个文件 ----------
+    def _process_all_dates(self, date_groups, rem_total, report, done_count, total):
+        sorted_dates = sorted(date_groups.keys())
+        date_list = [(ds, date_groups[ds]) for ds in sorted_dates]
+        slices = [[] for _ in range(3)]
+        for i, item in enumerate(date_list):
+            slices[i % 3].append(item)
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        def work(dates_slice, thread_idx):
+            for date_str, entries in dates_slice:
+                if self.stop_event.is_set(): return
+                self._process_one_date(date_str, entries, thread_idx, rem_total, report)
+        with ThreadPoolExecutor(max_workers=3) as exec:
+            fs = [exec.submit(work, slices[i], i) for i in range(3) if slices[i]]
+            for f in as_completed(fs):
+                try: f.result()
+                except Exception as e: report("log", f"Thread error: {e}")
 
-    def _copy_one(self, meta, date_str, location_map, report, fallback_location=None):
-        """复制单个文件到目标目录，写入阶段进度"""
-        location = None
-        inherited = False
-        if meta["gps"]:
-            k = f"{meta['gps'][0]},{meta['gps'][1]}"
-            location = location_map.get(k) if location_map else None
-        elif fallback_location:
-            location = fallback_location
-            inherited = True
+    def _process_one_date(self, date_str, entries, thread_idx, rem_total, report):
+        ts = self.thread_states[thread_idx]
+        file_metas = []; unique_gps = set()
+        for fp, is_video, ext in entries:
+            if self.stop_event.is_set(): return
+            fname = os.path.basename(fp)
+            ts["file"] = fname; ts["pct"] = 0; ts["phase"] = "read"
+            dt, device, gps = self._read_all_meta(fp, is_video)
+            file_metas.append({"path": fp, "device": device, "gps": gps,
+                "dt": dt, "ext": ext, "is_video": is_video,
+                "filename": fname, "name_no_ext": os.path.splitext(fname)[0]})
+            if gps: unique_gps.add(gps)
+            sz = self._fmt_size(os.path.getsize(fp))
+            report("file_info", f"{fname} | {dt.strftime('%Y-%m-%d %H:%M:%S')} | {device} | GPS: {'Y' if gps else 'N'} | {sz}")
+            with self.cache_lock:
+                self.file_cur += 1
 
-        device = meta["device"]
-        if meta["is_video"] and not meta["gps"]:
-            device_dir = f"{device}_视频"
-        elif device and location:
-            device_dir = f"{device} ({location})"
-        elif device:
-            device_dir = device
-        else:
-            device_dir = "未知位置"
+        location_map = {}
+        if unique_gps:
+            ts["phase"] = "geocode"
+            for gi, gps in enumerate(sorted(unique_gps)):
+                if self.stop_event.is_set(): return
+                ts["pct"] = round((gi + 1) / len(unique_gps) * 100)
+                r = self._geocode(gps[0], gps[1])
+                if r:
+                    k = f"{gps[0]},{gps[1]}"
+                    location_map[k] = r["short"]
+                    report("geocode", (gps, r["display"], r["short"]))
 
-        y = meta["dt"].strftime("%Y")
-        tdir = os.path.join(self.target_dir, y, date_str, device_dir)
-        tp = meta["dt"].strftime("%Y%m%d_%H%M%S")
-        new = f"{tp}_{meta['name_no_ext']}{meta['ext']}"
-        dst = os.path.join(tdir, new)
-        c = 1
-        while os.path.exists(dst):
-            new = f"{tp}_{meta['name_no_ext']}_{c}{meta['ext']}"
-            dst = os.path.join(tdir, new); c += 1
+        fallback_location = None
+        if location_map:
+            from collections import Counter
+            locs = [v for v in location_map.values() if v and v != "API error"]
+            if locs: fallback_location = Counter(locs).most_common(1)[0][0]
 
-        try:
-            os.makedirs(tdir, exist_ok=True)
-            shutil.copy2(meta["path"], dst)
-        except Exception as e:
-            report("log", f"✗ {meta['filename']}: {e}")
-            self.cache["processed"][meta["path"]] = {"error": str(e), "copied": False,
-                "processed_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+        for meta in [m for m in file_metas if m["gps"]] + [m for m in file_metas if not m["gps"]]:
+            if self.stop_event.is_set(): return
+            is_inherited = not meta["gps"] and fallback_location is not None
+            loc = fallback_location if is_inherited else None
+            if meta["gps"]:
+                k = f"{meta['gps'][0]},{meta['gps'][1]}"
+                loc = location_map.get(k)
+            ts["file"] = meta["filename"]; ts["phase"] = "copy"; ts["pct"] = 0
+
+            device = meta["device"]
+            if meta["is_video"] and not meta["gps"]:
+                device_dir = f"{device}_video"
+            elif device and loc:
+                device_dir = f"{device} ({loc})"
+            elif device:
+                device_dir = device
+            else:
+                device_dir = "unknown"
+            y = meta["dt"].strftime("%Y")
+            tdir = os.path.join(self.target_dir, y, date_str, device_dir)
+            tp = meta["dt"].strftime("%Y%m%d_%H%M%S")
+            new = f"{tp}_{meta['name_no_ext']}{meta['ext']}"
+            dst = os.path.join(tdir, new); c = 1
+            while os.path.exists(dst):
+                new = f"{tp}_{meta['name_no_ext']}_{c}{meta['ext']}"
+                dst = os.path.join(tdir, new); c += 1
+            try:
+                os.makedirs(tdir, exist_ok=True)
+                shutil.copy2(meta["path"], dst)
+            except Exception as e:
+                report("log", f"FAIL {meta['filename']}: {e}")
+                with self.cache_lock:
+                    self.cache["processed"][meta["path"]] = {"error": str(e), "copied": False}
+                    self._errors += 1
+                self._save_cache(); continue
+
+            report("log", f"OK {meta['filename']} -> {date_str}/{device_dir}/{new}")
+            with self.cache_lock:
+                self.cache["processed"][meta["path"]] = {
+                    "copied": True, "target": dst, "date": date_str, "year": y,
+                    "device": device, "gps": meta["gps"], "location": loc,
+                    "inherited_gps": is_inherited, "is_video": meta["is_video"]}
+                self._success += 1
+                self.write_pct = math.ceil((self._success + self._errors) / rem_total * 100) if rem_total else 0
             self._save_cache()
-            return
-
-        tag = " ↩" if inherited else ""
-        report("log", f"✓ {meta['filename']} → {date_str}/{device_dir}/{new}{tag}")
-        self.cache["processed"][meta["path"]] = {"copied": True, "target": dst,
-            "date": date_str, "year": y, "device": device, "gps": meta["gps"],
-            "location": location, "inherited_gps": inherited, "is_video": meta["is_video"],
-            "processed_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
-        self._save_cache()
-        report("progress", 1)
-
-
-# ============================================================
-# GUI
-# ============================================================
-
+            ts["pct"] = 100
+        report("log", f"  Done {date_str} ({len(file_metas)} files)")
 class PhotoOrganizerGUI:
     def __init__(self):
         self.root = tk.Tk()
@@ -661,6 +562,11 @@ class PhotoOrganizerGUI:
         self.stats_gps = tk.StringVar(value="0")
         self.geo_total = tk.StringVar(value="0")
         self.geo_current = tk.StringVar(value="—")
+        self.thread_vars = [
+            {"file": tk.StringVar(value="—"), "pct": tk.DoubleVar(value=0), "phase": tk.StringVar(value="")},
+            {"file": tk.StringVar(value="—"), "pct": tk.DoubleVar(value=0), "phase": tk.StringVar(value="")},
+            {"file": tk.StringVar(value="—"), "pct": tk.DoubleVar(value=0), "phase": tk.StringVar(value="")},
+        ]
         self.phase_var = tk.StringVar(value="等待开始")
         self.sub_progress = tk.StringVar(value="")
 
@@ -809,6 +715,30 @@ class PhotoOrganizerGUI:
                   font=('Consolas', 8)).pack(side=tk.LEFT, padx=(2, 0))
 
         # ── 总进度 ──
+        # — Thread 1 —
+        t0_row = ttk.Frame(prog_frame)
+        t0_row.pack(fill=tk.X, pady=1)
+        ttk.Label(t0_row, text="🧵 T1:", font=("Microsoft YaHei UI", 8), width=5).pack(side=tk.LEFT)
+        ttk.Label(t0_row, textvariable=self.thread_vars[0]["file"], font=("Consolas", 8), width=24, anchor="w").pack(side=tk.LEFT)
+        self.thread_bar_0 = ttk.Progressbar(t0_row, variable=self.thread_vars[0]["pct"], length=200, mode="determinate")
+        self.thread_bar_0.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(2, 2))
+        ttk.Label(t0_row, textvariable=self.thread_vars[0]["phase"], font=("Consolas", 8), width=8, anchor="w").pack(side=tk.LEFT)
+        # — Thread 2 —
+        t1_row = ttk.Frame(prog_frame)
+        t1_row.pack(fill=tk.X, pady=1)
+        ttk.Label(t1_row, text="🧵 T2:", font=("Microsoft YaHei UI", 8), width=5).pack(side=tk.LEFT)
+        ttk.Label(t1_row, textvariable=self.thread_vars[1]["file"], font=("Consolas", 8), width=24, anchor="w").pack(side=tk.LEFT)
+        self.thread_bar_1 = ttk.Progressbar(t1_row, variable=self.thread_vars[1]["pct"], length=200, mode="determinate")
+        self.thread_bar_1.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(2, 2))
+        ttk.Label(t1_row, textvariable=self.thread_vars[1]["phase"], font=("Consolas", 8), width=8, anchor="w").pack(side=tk.LEFT)
+        # — Thread 3 —
+        t2_row = ttk.Frame(prog_frame)
+        t2_row.pack(fill=tk.X, pady=1)
+        ttk.Label(t2_row, text="🧵 T3:", font=("Microsoft YaHei UI", 8), width=5).pack(side=tk.LEFT)
+        ttk.Label(t2_row, textvariable=self.thread_vars[2]["file"], font=("Consolas", 8), width=24, anchor="w").pack(side=tk.LEFT)
+        self.thread_bar_2 = ttk.Progressbar(t2_row, variable=self.thread_vars[2]["pct"], length=200, mode="determinate")
+        self.thread_bar_2.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(2, 2))
+        ttk.Label(t2_row, textvariable=self.thread_vars[2]["phase"], font=("Consolas", 8), width=8, anchor="w").pack(side=tk.LEFT)
         total_row = ttk.Frame(prog_frame)
         total_row.pack(fill=tk.X, pady=1)
         ttk.Label(total_row, text="📊 总进度:", font=('Microsoft YaHei UI', 8)).pack(side=tk.LEFT)
@@ -1034,6 +964,18 @@ class PhotoOrganizerGUI:
             self.read_progress_text.set(f"{self.engine.read_file}  {self.engine.read_pct}%")
             self.write_progress_var.set(self.engine.write_pct)
             self.write_progress_text.set(f"{self.engine.write_file}  {self.engine.write_pct}%")
+            st = self.engine.thread_states[0]
+            self.thread_vars[0]["file"].set(st["file"])
+            self.thread_vars[0]["pct"].set(st["pct"])
+            self.thread_vars[0]["phase"].set(st["phase"])
+            st = self.engine.thread_states[1]
+            self.thread_vars[1]["file"].set(st["file"])
+            self.thread_vars[1]["pct"].set(st["pct"])
+            self.thread_vars[1]["phase"].set(st["phase"])
+            st = self.engine.thread_states[2]
+            self.thread_vars[2]["file"].set(st["file"])
+            self.thread_vars[2]["pct"].set(st["pct"])
+            self.thread_vars[2]["phase"].set(st["phase"])
             cur, tot = self.engine.file_cur, self.engine.file_tot
             self.progress_bar.configure(maximum=max(tot, 1))
             self.progress_var.set(min(cur, tot))
@@ -1122,6 +1064,15 @@ class PhotoOrganizerGUI:
         self.geo_text.config(state=tk.DISABLED)
         self.geo_total.set("0")
         self.geo_current.set("—")
+        self.thread_vars[2]["phase"].set("")
+        self.thread_vars[2]["pct"].set(0)
+        self.thread_vars[2]["file"].set("—")
+        self.thread_vars[1]["phase"].set("")
+        self.thread_vars[1]["pct"].set(0)
+        self.thread_vars[1]["file"].set("—")
+        self.thread_vars[0]["phase"].set("")
+        self.thread_vars[0]["pct"].set(0)
+        self.thread_vars[0]["file"].set("—")
 
     def run(self):
         self.root.mainloop()
