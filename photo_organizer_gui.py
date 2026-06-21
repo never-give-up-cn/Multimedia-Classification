@@ -55,9 +55,11 @@ class ProcessingEngine:
 
         # GUI 轮询用的共享状态（线程安全，GIL 保护）
         self.read_file = ""
-        self.read_pct = 0
+        self.read_pct = 0           # 累计读取百分比
         self.write_file = ""
-        self.write_pct = 0
+        self.write_pct = 0          # 累计写入百分比
+        self.file_read_pct = 0      # 单文件读取进度 0-100
+        self.file_write_pct = 0     # 单文件写入进度 0-100
         self.file_cur = 0
         self.file_tot = 0
 
@@ -441,14 +443,13 @@ class ProcessingEngine:
             report("current", rel)
             report("sub_progress", (idx + 1, rem_total))
             self.read_file = fname
-            pct = math.ceil((idx + 1) / rem_total * 100)
-            self.read_pct = pct
-            report("progress_update", (pct, fname))
+            self.file_read_pct = 100
+            report("file_read", (100, fname))
 
             ext = os.path.splitext(fp)[1].lower()
             is_video = ext in VIDEO_EXTS
 
-            # 一次读取：日期 + 设备 + GPS
+            # 读取：日期 + 设备 + GPS
             dt = None
             date_source = "文件创建时间"
             if is_video:
@@ -465,6 +466,8 @@ class ProcessingEngine:
 
             device = self._read_device(fp) or "未知设备"
             gps = self._read_gps(fp)
+
+            self.read_pct = math.ceil((idx + 1) / rem_total * 100)  # 累计
 
             meta = {"path": fp, "device": device, "gps": gps,
                     "dt": dt, "ext": ext, "is_video": is_video,
@@ -538,9 +541,12 @@ class ProcessingEngine:
                     if self.stop_event.is_set():
                         report("log", "⏹ 已暂停"); report("done", False); return
                     self.write_file = meta["filename"]
+                    report("file_write", (0, meta["filename"]))
                     self._copy_one(meta, date_str, location_map, report)
                     write_so_far += 1
-                    self.write_pct = math.ceil(write_so_far / rem_total * 100) if rem_total else 0
+                    self.write_pct = math.ceil(write_so_far / rem_total * 100) if rem_total else 0  # 累计
+                    self.file_write_pct = 100
+                    report("file_write", (100, meta["filename"]))
                     self.file_cur = write_so_far
                     self.file_tot = rem_total
                     report("sub_progress", (fi + 1, len(gps_m)))
@@ -557,9 +563,12 @@ class ProcessingEngine:
                     if self.stop_event.is_set():
                         report("log", "⏹ 已暂停"); report("done", False); return
                     self.write_file = meta["filename"]
+                    report("file_write", (0, meta["filename"]))
                     self._copy_one(meta, date_str, {}, report, fallback_location)
                     write_so_far += 1
-                    self.write_pct = math.ceil(write_so_far / rem_total * 100) if rem_total else 0
+                    self.write_pct = math.ceil(write_so_far / rem_total * 100) if rem_total else 0  # 累计
+                    self.file_write_pct = 100
+                    report("file_write", (100, meta["filename"]))
                     self.file_cur = write_so_far
                     self.file_tot = rem_total
                     report("sub_progress", (fi + 1, len(nogps_m)))
@@ -655,11 +664,16 @@ class PhotoOrganizerGUI:
         self.phase_var = tk.StringVar(value="等待开始")
         self.sub_progress = tk.StringVar(value="")
 
-        # 读取/写入进度
+        # 累计进度
         self.read_progress_var = tk.DoubleVar(value=0)
         self.read_progress_text = tk.StringVar(value="—")
         self.write_progress_var = tk.DoubleVar(value=0)
         self.write_progress_text = tk.StringVar(value="—")
+        # 单文件进度
+        self.file_read_var = tk.DoubleVar(value=0)
+        self.file_read_text = tk.StringVar(value="—")
+        self.file_write_var = tk.DoubleVar(value=0)
+        self.file_write_text = tk.StringVar(value="—")
 
         # 文件信息
         self.file_info_var = tk.StringVar(value="等待开始...")
@@ -772,6 +786,26 @@ class PhotoOrganizerGUI:
                                      length=400, mode='determinate')
         write_bar.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 4))
         ttk.Label(write_row, textvariable=self.write_progress_text,
+                  font=('Consolas', 8)).pack(side=tk.LEFT, padx=(2, 0))
+
+        # ── 单文件读取 ──
+        fr_row = ttk.Frame(prog_frame)
+        fr_row.pack(fill=tk.X, pady=1)
+        ttk.Label(fr_row, text="📄 文件读:", font=('Microsoft YaHei UI', 8)).pack(side=tk.LEFT)
+        fr_bar = ttk.Progressbar(fr_row, variable=self.file_read_var,
+                                  length=400, mode='determinate')
+        fr_bar.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 4))
+        ttk.Label(fr_row, textvariable=self.file_read_text,
+                  font=('Consolas', 8)).pack(side=tk.LEFT, padx=(2, 0))
+
+        # ── 单文件写入 ──
+        fw_row = ttk.Frame(prog_frame)
+        fw_row.pack(fill=tk.X, pady=1)
+        ttk.Label(fw_row, text="📄 文件写:", font=('Microsoft YaHei UI', 8)).pack(side=tk.LEFT)
+        fw_bar = ttk.Progressbar(fw_row, variable=self.file_write_var,
+                                  length=400, mode='determinate')
+        fw_bar.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 4))
+        ttk.Label(fw_row, textvariable=self.file_write_text,
                   font=('Consolas', 8)).pack(side=tk.LEFT, padx=(2, 0))
 
         # ── 总进度 ──
@@ -922,6 +956,10 @@ class PhotoOrganizerGUI:
         self.read_progress_text.set("—")
         self.write_progress_var.set(0)
         self.write_progress_text.set("—")
+        self.file_read_var.set(0)
+        self.file_read_text.set("—")
+        self.file_write_var.set(0)
+        self.file_write_text.set("—")
         self.file_info_var.set("等待开始...")
 
         self._clear_geo()
@@ -991,14 +1029,11 @@ class PhotoOrganizerGUI:
 
         # 从引擎直接读取进度状态
         if self.engine:
-            rp = self.engine.read_pct
-            self.read_progress_var.set(rp)
-            txt = f"{self.engine.read_file}  {rp}%"
-            self.read_progress_text.set(txt)
+            # 累计进度
+            self.read_progress_var.set(self.engine.read_pct)
+            self.read_progress_text.set(f"{self.engine.read_file}  {self.engine.read_pct}%")
             self.write_progress_var.set(self.engine.write_pct)
-            txt = f"{self.engine.write_file}  {self.engine.write_pct}%"
-            self.write_progress_text.set(txt)
-
+            self.write_progress_text.set(f"{self.engine.write_file}  {self.engine.write_pct}%")
             cur, tot = self.engine.file_cur, self.engine.file_tot
             self.progress_bar.configure(maximum=max(tot, 1))
             self.progress_var.set(min(cur, tot))
@@ -1008,7 +1043,6 @@ class PhotoOrganizerGUI:
             if tot:
                 self.stats_total.set(str(tot))
 
-        self.root.after_idle(self.root.update_idletasks)
         self.root.after(30, self._poll_queue)
 
     def _handle_message(self, msg_type, data):
@@ -1021,11 +1055,14 @@ class PhotoOrganizerGUI:
         elif msg_type == "sub_progress":
             cur, tot = data
             self.sub_progress.set(f"[{cur}/{tot}]")
-        elif msg_type == "progress_update":
+        elif msg_type == "file_read":
             pct, fname = data
-            self.read_progress_var.set(pct)
-            self.read_bar.configure(value=pct)
-            self.read_progress_text.set(f"{fname}  {pct}%")
+            self.file_read_var.set(pct)
+            self.file_read_text.set(f"{fname}  ✅")
+        elif msg_type == "file_write":
+            pct, fname = data
+            self.file_write_var.set(pct)
+            self.file_write_text.set(f"{fname}  {pct}%")
         elif msg_type == "file_info":
             self.file_info_var.set(str(data))
         elif msg_type == "status":
