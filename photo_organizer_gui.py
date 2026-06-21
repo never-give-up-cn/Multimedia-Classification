@@ -15,6 +15,7 @@ import shutil
 import time
 import re
 import subprocess
+import math
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -440,7 +441,9 @@ class ProcessingEngine:
             report("current", rel)
             report("sub_progress", (idx + 1, rem_total))
             self.read_file = fname
-            self.read_pct = 0
+            pct = math.ceil((idx + 1) / rem_total * 100)
+            self.read_pct = pct
+            report("progress_update", (pct, fname))
 
             ext = os.path.splitext(fp)[1].lower()
             is_video = ext in VIDEO_EXTS
@@ -452,7 +455,6 @@ class ProcessingEngine:
                 dt = self._read_video_date(fp)
             else:
                 dt = self._read_image_date(fp)
-            self.read_pct = 50
             if dt:
                 date_source = "EXIF"
             else:
@@ -463,7 +465,6 @@ class ProcessingEngine:
 
             device = self._read_device(fp) or "未知设备"
             gps = self._read_gps(fp)
-            self.read_pct = 100
 
             meta = {"path": fp, "device": device, "gps": gps,
                     "dt": dt, "ext": ext, "is_video": is_video,
@@ -487,6 +488,7 @@ class ProcessingEngine:
         # === 阶段三：逐天处理（地理编码+复制） ===
         success = errors = 0
         write_so_far = 0
+        self.write_pct = 0
         sorted_dates = sorted(date_groups.keys())
 
         for date_idx, date_str in enumerate(sorted_dates):
@@ -536,10 +538,9 @@ class ProcessingEngine:
                     if self.stop_event.is_set():
                         report("log", "⏹ 已暂停"); report("done", False); return
                     self.write_file = meta["filename"]
-                    self.write_pct = 0
                     self._copy_one(meta, date_str, location_map, report)
                     write_so_far += 1
-                    self.write_pct = 100
+                    self.write_pct = math.ceil(write_so_far / rem_total * 100) if rem_total else 0
                     self.file_cur = write_so_far
                     self.file_tot = rem_total
                     report("sub_progress", (fi + 1, len(gps_m)))
@@ -556,10 +557,9 @@ class ProcessingEngine:
                     if self.stop_event.is_set():
                         report("log", "⏹ 已暂停"); report("done", False); return
                     self.write_file = meta["filename"]
-                    self.write_pct = 0
                     self._copy_one(meta, date_str, {}, report, fallback_location)
                     write_so_far += 1
-                    self.write_pct = 100
+                    self.write_pct = math.ceil(write_so_far / rem_total * 100) if rem_total else 0
                     self.file_cur = write_so_far
                     self.file_tot = rem_total
                     report("sub_progress", (fi + 1, len(nogps_m)))
@@ -683,7 +683,7 @@ class PhotoOrganizerGUI:
         self._build_ui()
 
         # 定时检查队列
-        self.root.after(100, self._poll_queue)
+        self.root.after(30, self._poll_queue)
 
     def _build_ui(self):
         # ---------- 样式 ----------
@@ -758,9 +758,9 @@ class PhotoOrganizerGUI:
         read_row = ttk.Frame(prog_frame)
         read_row.pack(fill=tk.X, pady=1)
         ttk.Label(read_row, text="📖 读取:", font=('Microsoft YaHei UI', 8)).pack(side=tk.LEFT)
-        read_bar = ttk.Progressbar(read_row, variable=self.read_progress_var,
-                                    length=400, mode='determinate')
-        read_bar.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 4))
+        self.read_bar = ttk.Progressbar(read_row, variable=self.read_progress_var,
+                                         length=400, mode='determinate')
+        self.read_bar.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 4))
         ttk.Label(read_row, textvariable=self.read_progress_text,
                   font=('Consolas', 8)).pack(side=tk.LEFT, padx=(2, 0))
 
@@ -942,6 +942,8 @@ class PhotoOrganizerGUI:
         self.stats_cache.set(str(len(self.engine.cache["processed"])))
         self.stats_gps.set(str(len(self.engine.cache["geocode"])))
 
+
+
         self.worker_thread = threading.Thread(
             target=self.engine.run,
             args=(self._report, self._total_files),
@@ -987,12 +989,12 @@ class PhotoOrganizerGUI:
         except queue.Empty:
             pass
 
-        # 从引擎直接读取进度状态（实时，不受队列延迟影响）
+        # 从引擎直接读取进度状态
         if self.engine:
-            self.read_progress_var.set(self.engine.read_pct)
-            txt = f"{self.engine.read_file}  {self.engine.read_pct}%"
+            rp = self.engine.read_pct
+            self.read_progress_var.set(rp)
+            txt = f"{self.engine.read_file}  {rp}%"
             self.read_progress_text.set(txt)
-
             self.write_progress_var.set(self.engine.write_pct)
             txt = f"{self.engine.write_file}  {self.engine.write_pct}%"
             self.write_progress_text.set(txt)
@@ -1000,13 +1002,14 @@ class PhotoOrganizerGUI:
             cur, tot = self.engine.file_cur, self.engine.file_tot
             self.progress_bar.configure(maximum=max(tot, 1))
             self.progress_var.set(min(cur, tot))
-            pct = round(cur / max(tot, 1) * 100)
+            pct = math.ceil(cur / max(tot, 1) * 100)
             self.progress_text.set(f"文件 {cur} / {tot}  ({pct}%)")
             self.stats_done.set(str(cur))
             if tot:
                 self.stats_total.set(str(tot))
 
-        self.root.after(200, self._poll_queue)
+        self.root.after_idle(self.root.update_idletasks)
+        self.root.after(30, self._poll_queue)
 
     def _handle_message(self, msg_type, data):
         if msg_type == "log":
@@ -1018,6 +1021,11 @@ class PhotoOrganizerGUI:
         elif msg_type == "sub_progress":
             cur, tot = data
             self.sub_progress.set(f"[{cur}/{tot}]")
+        elif msg_type == "progress_update":
+            pct, fname = data
+            self.read_progress_var.set(pct)
+            self.read_bar.configure(value=pct)
+            self.read_progress_text.set(f"{fname}  {pct}%")
         elif msg_type == "file_info":
             self.file_info_var.set(str(data))
         elif msg_type == "status":
