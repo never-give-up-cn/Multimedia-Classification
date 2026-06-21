@@ -63,6 +63,17 @@ class ProcessingEngine:
         self.file_cur = 0
         self.file_tot = 0
 
+        # 多线程支持
+        self.rate_limiter = RateLimiter(10)  # 所有线程共享 10次/秒
+        self.cache_lock = threading.Lock()
+        self.thread_states = [
+            {"idx": 0, "file": "", "pct": 0, "phase": ""},
+            {"idx": 1, "file": "", "pct": 0, "phase": ""},
+            {"idx": 2, "file": "", "pct": 0, "phase": ""},
+        ]
+        self._success = 0
+        self._errors = 0
+
     # ---------- 缓存 ----------
 
     def _load_cache(self):
